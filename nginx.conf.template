@@ -1,0 +1,119 @@
+#user  nobody;
+worker_processes  auto;
+worker_rlimit_nofile 10000;
+
+error_log  logs/info.log info;
+error_log  logs/error.log;
+pid        logs/nginx.pid;
+
+events {
+    worker_connections  65535;
+    multi_accept on;
+    accept_mutex_delay 100ms;
+    use epoll;
+}
+
+http {
+    server_tokens   off;
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] $host "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log logs/access.log  main;
+    
+    client_body_temp_path /var/run/openresty/nginx-client-body;
+    proxy_temp_path       /var/run/openresty/nginx-proxy;
+    fastcgi_temp_path     /var/run/openresty/nginx-fastcgi;
+    uwsgi_temp_path       /var/run/openresty/nginx-uwsgi;
+    scgi_temp_path        /var/run/openresty/nginx-scgi;
+
+    sendfile        on;
+    tcp_nopush     on;
+    keepalive_timeout  60;
+    reset_timedout_connection  on;
+    #gzip  on;
+
+    server {
+        client_max_body_size 20M;
+        listen       80;
+        server_name  ${SERVICE_FQDN};
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+
+        proxy_redirect          off;
+        proxy_cache             off;
+        proxy_buffering         off;
+        proxy_connect_timeout   60;
+        proxy_read_timeout      60;
+        proxy_send_timeout      60;
+
+	# proxy
+	set $hostheader ${SERVICE_FQDN};
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host   $hostheader;
+	    proxy_set_header X-Forwarded-Proto https;
+        
+        location /webp-conv {
+            internal;
+            resolver 8.8.8.8 8.8.4.4 valid=15s;
+            proxy_http_version 1.1;
+            proxy_read_timeout 10;
+            set $hostheader "${WEBP_SERVER}";
+            proxy_pass https://$hostheader/$webp_uri;
+        }
+        location /conv-fail {
+            internal;
+            resolver 8.8.8.8 8.8.4.4 valid=15s;
+            proxy_http_version 1.1;
+            proxy_read_timeout 10;
+            proxy_set_header Host "${SERVICE_FQDN}";
+            set $hostheader "${ORG_SERVER}";
+            proxy_pass ${ORG_PREFIX}://$hostheader/$request_uri;
+        }
+        location / {
+            resolver 8.8.8.8 8.8.4.4 valid=15s;
+            proxy_http_version 1.1;
+            set $org_backend "${ORG_SERVER}";
+            #set $p_host "${ORG_SERVER}";
+            set $webp_backend "${WEBP_SERVER}";
+            set $org_port "${ORG_PORT}";
+            set $url_prefix "${ORG_PREFIX}";
+            set $dst_host "";
+            set $webp_uri "";
+            default_type text/plain;
+            content_by_lua_block {
+                if string.match(ngx.req.get_headers()["Accept"], "image/webp") then
+                    --outou = ngx.location.capture("/webp-conv" , { vars = { webp_uri = "?url=${ORG_PREFIX}://${SERVICE_FQDN}"..ngx.var.uri.."&op=format&fmt=webp&resolve_ip="..ngx.var.p_host.."&resolve_port=${ORG_PORT}"}});
+                    outou = ngx.location.capture("/webp-conv" , { vars = { webp_uri = "?url=${ORG_PREFIX}://${SERVICE_FQDN}"..ngx.var.uri.."&op=format&fmt=webp&resolve_ip=${ORG_SERVER}&resolve_port=${ORG_PORT}"}});
+                    --ngx.log(ngx.INFO, "pilbox status code: ", outou.status);
+                    if (outou.status == 200) then
+                        --foo = ngx.header["Content-Type"];
+                        ngx.header.Content_Type = "image/webp";
+                        ngx.header.Content_Length = outou.header["Content-Length"];
+                        ngx.header.Last_Modified = outou.header["last-modified"];
+                        ngx.say(outou.body)
+                    elseif(outou.status == 304) then
+                        ngx.status = outou.status;
+                        --ngx.log(ngx.INFO, "STATUS", outou.status);
+                    else
+                        outou2 = ngx.location.capture("/conv-fail" , { vars = { dst_host = ngx.var.http_host }});
+                        ngx.header.Last_Modified = outou2.header["Last-Modified"];
+                        ngx.header.Content_Length = outou2.header["Content-Length"];
+                        ngx.say(outou2.body)
+                    end
+                else
+                    outou2 = ngx.location.capture("/conv-fail" , { vars = { dst_host = ngx.var.http_host }});
+                    ngx.header.Last_Modified = outou2.header["Last-Modified"];
+                    ngx.header.Content_Length = outou2.header["Content-Length"];
+                    ngx.say(outou2.body)
+                end
+            }
+        }
+    }
+}
